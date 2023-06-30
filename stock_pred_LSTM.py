@@ -8,7 +8,18 @@ from keras.layers import Dense, Dropout, LSTM
 prediction_days = 60
 
 
-def train_model(scaled_data):
+def train_model(scaler_data, train_inputs):
+    close_scaled = scaler_data["Close"]
+    roc_scaled = scaler_data["ROC"]
+    switch_train = {
+        "Close": close_scaled,
+        "ROC": roc_scaled
+    }
+    scaled_data = close_scaled
+    if train_inputs["num_of_inputs"] == 1:
+        scaled_data = switch_train[train_inputs["input_type"]]
+    if train_inputs["num_of_inputs"] == 2:
+        scaled_data = np.concatenate((close_scaled, roc_scaled), axis=1)
     # Prepare the training data
     x_train = []
     y_train = []
@@ -28,15 +39,26 @@ def train_model(scaled_data):
 
     return lstm_model
 
-def predict_candle_price(lstm_model, df, scaler):
-    last_data = df["Close"].values[-prediction_days:].reshape(-1, 1)
-    last_data_scaled = scaler.transform(last_data)
+def predict_candle_price(lstm_model, df, scaler, train_inputs):
+
+    close_scaled = scaler["Close"].transform(df["Close"].values[-prediction_days:].reshape(-1, 1))
+    roc_scaled = scaler["ROC"].transform(df["ROC"].values[-prediction_days:].reshape(-1, 1))
+    switch_train = {
+        "Close": close_scaled,
+        "ROC": roc_scaled
+    }
+    scaled_data = close_scaled
+    if train_inputs["num_of_inputs"] == 1:
+        scaled_data = switch_train[train_inputs["input_type"]]
+    if train_inputs["num_of_inputs"] == 2:
+        scaled_data = np.concatenate((close_scaled, roc_scaled), axis=1)
     x_predict = []
-    x_predict.append(last_data_scaled)
+    x_predict.append(scaled_data)
     x_predict = np.array(x_predict)
     x_predict = np.reshape(x_predict, (x_predict.shape[0], x_predict.shape[1], 1))
     predicted_price = lstm_model.predict(x_predict)
-    predicted_price = scaler.inverse_transform(predicted_price)
+    predicted_price = scaler["Close"].inverse_transform(predicted_price)
+
     return predicted_price
 
 
