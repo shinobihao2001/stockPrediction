@@ -1,8 +1,6 @@
 import logging
 import pandas as pd
 import numpy as np
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, LSTM
 from sklearn.preprocessing import MinMaxScaler
 import dash
 from dash import dcc, html
@@ -12,6 +10,8 @@ import websocket
 import json
 from binance.spot import Spot as Client
 import threading
+import stock_pred_LSTM as lstm
+import stock_pred_RNN as rnn
 
 # Set up the logging configuration
 # logging.basicConfig(level=logging.DEBUG)
@@ -49,44 +49,56 @@ df = df.astype(float)
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_data = scaler.fit_transform(df["Close"].values.reshape(-1, 1))
 
-# Define the number of days for prediction
-prediction_days = 60
+lstm_model = lstm.train_model(scaled_data)
+print("LSTM model trained")
+rnn_model = rnn.train_model(scaled_data)
+print("RNN model trained")
 
-# Prepare the training data
-x_train = []
-y_train = []
-for x in range(prediction_days, len(scaled_data)):
-    x_train.append(scaled_data[x - prediction_days:x, 0])
-    y_train.append(scaled_data[x, 0])
-x_train, y_train = np.array(x_train), np.array(y_train)
-x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+selected_model = "LSTM"
 
-# Create the LSTM model
-lstm_model = Sequential()
-lstm_model.add(LSTM(units=50, return_sequences=True, input_shape=(x_train.shape[1], 1)))
-lstm_model.add(LSTM(units=50))
-lstm_model.add(Dense(1))
-lstm_model.compile(loss="mean_squared_error", optimizer="adam")
-lstm_model.fit(x_train, y_train, epochs=1, batch_size=1, verbose=2)
+def predicted_candlestick(modeltype, df, scaler, next_open_time):
+    swithc_model = {
+        "LSTM": {
+            "model": lstm,
+            "train_model": lstm_model
+        },
+        "RNN": {
+            "model": rnn,
+            "train_model": rnn_model
+        }
+
+    }
+    model = swithc_model[modeltype]["model"]
+    model_train = swithc_model[modeltype]["train_model"]
+    predicted_price = model.predict_candle_price(model_train, df, scaler)
+    predicted_price = predicted_price[0][0]
+    current_price = df["Close"].values[-1]
+    prredicted_candle = {
+        "Open time": None,
+        "Open": None,
+        "High": None,
+        "Low": None,
+        "Close": None
+    }
+    prredicted_candle["Open time"] = next_open_time
+    prredicted_candle["Open"] = current_price
+    prredicted_candle["High"] = max(current_price, predicted_price)
+    prredicted_candle["Low"] = min(current_price, predicted_price)
+    prredicted_candle["Close"] = predicted_price
+    return prredicted_candle
+
+predicted_candle = predicted_candlestick(selected_model, df, scaler, 
+                                          pd.to_datetime(df.index[-1], unit="ms") + pd.Timedelta(minutes=int(interval[:-1])))
 
 # Set up the WebSocket connection
 SOCKET = f'wss://stream.binance.com:9443/ws/{crypto_name.lower()}@kline_{interval}'
 ws = websocket.WebSocketApp(SOCKET)
 
-prredicted_candle = {
-    "Open time": 0,
-    "Open": 0,
-    "High": 0,
-    "Low": 0,
-    "Close": 0,
-}
-
 def on_message(ws, message):
-    global df
+    global df, predicted_candle
     json_message = json.loads(message)
     candle = json_message['k']
     is_candle_closed = candle['x']
-
     opentime = candle['t']
     opentime = pd.to_datetime(opentime, unit="ms")
     open = candle['o']
@@ -107,20 +119,9 @@ def on_message(ws, message):
 
     if is_candle_closed:
         # Predict next crypto price
-        last_data = df["Close"].values[-prediction_days:].reshape(-1, 1)
-        scaled_last_data = scaler.transform(last_data)
-        x_predict = np.array([scaled_last_data])
-        x_predict = np.reshape(x_predict, (x_predict.shape[0], x_predict.shape[1], 1))
-        predicted_data = lstm_model.predict(x_predict)
-        predicted_price = scaler.inverse_transform(predicted_data)
-        predicted_price = predicted_price[0][0]
-        current_price = df["Close"].values[-1]
-        prredicted_candle["Open time"] = pd.to_datetime(candle['T'], unit="ms")
-        prredicted_candle["Open"] = current_price
-        prredicted_candle["High"] = max(current_price, predicted_price)
-        prredicted_candle["Low"] = min(current_price, predicted_price)
-        prredicted_candle["Close"] = predicted_price
-        print(prredicted_candle)
+        predicted_candle = predicted_candlestick(selected_model, df, scaler, 
+                                          pd.to_datetime(df.index[-1], unit="ms") + pd.Timedelta(minutes=int(interval[:-1])))
+        #print(prredicted_candle)
 
 
 def on_close(ws):
@@ -139,31 +140,41 @@ def run_websocket():
 ws_thread = threading.Thread(target=run_websocket)
 ws_thread.start()
 
+
+
+
 # # Update the candlestick chart in the Dash app
-@app.callback(Output("crypto_chart", "figure"), [Input("update_interval", "n_intervals")])
-def update_chart(n):
-    recent_data = df.tail(10)
+@app.callback(Output("crypto_chart", "figure"), [Input("update_interval", "n_intervals"), Input("algorithm", "value")])
+def update_chart(n, algorithm):
+    recent_data = df.tail(20)
+    global selected_model, predicted_candle
+    if algorithm != selected_model:
+        predicted_candle = predicted_candlestick(algorithm, df, scaler,
+                                            pd.to_datetime(df.index[-1], unit="ms") + pd.Timedelta(minutes=int(interval[:-1])))
+        selected_model = algorithm
+
     predicted_trace = go.Candlestick(
-        x=[prredicted_candle["Open time"]],
-        open=[prredicted_candle["Open"]],
-        high=[prredicted_candle["High"]],
-        low=[prredicted_candle["Low"]],
-        close=[prredicted_candle["Close"]],
-        name="Predicted Candlestick",
-        increasing_line_color="yellow",
-        decreasing_line_color="orange"
-    )
+            x=[predicted_candle["Open time"]],
+            open=[predicted_candle["Open"]],
+            high=[predicted_candle["High"]],
+            low=[predicted_candle["Low"]],
+            close=[predicted_candle["Close"]],
+            name= "{} Predicted Price".format(algorithm),
+            increasing_line_color="yellow",
+            decreasing_line_color="orange"
+        )
     fig = go.Figure(data=[
-        go.Candlestick(
-            x=recent_data.index,
-            open=recent_data['Open'],
-            high=recent_data['High'],
-            low=recent_data['Low'],
-            close=recent_data['Close'],
-            name="Candlesticks"
-        ),
-    ])
+            go.Candlestick(
+                x=recent_data.index,
+                open=recent_data['Open'],
+                high=recent_data['High'],
+                low=recent_data['Low'],
+                close=recent_data['Close'],
+                name="Candlesticks"
+            ),
+        ])
     fig.add_trace(predicted_trace)
+    
     return fig
 
 
@@ -176,7 +187,11 @@ app.layout = html.Div(children=[
     '''),
 
     html.Div(children=[html.Label("Thuật toán: "),
-        dcc.Dropdown(['XGBoost','RNN','LSTM'],'LSTM',style={'width':150}),]
+        dcc.Dropdown(id="algorithm",options=['XGBoost','RNN','LSTM'],
+                     value='LSTM',
+                        clearable=False,
+                    searchable=False
+                     ,style={'width':150}),]
     ),
 
     html.Div(children=[html.Label("Giá trị dự đoán: "),
